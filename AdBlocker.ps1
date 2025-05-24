@@ -456,3 +456,44 @@ $blacklist = @(
     "allowednet.com", "ad-flow.com", "adflow.com", "alfaspace.net", "advance.net",
     "akamaitech.net", "akamai.net", "adbureau.net"
 )
+
+
+function Disable-DoH {
+    Write-Host "Disabling DNS-over-HTTPS (DoH) for all major browsers..."
+
+    # Chrome, Brave, Vivaldi, Opera (Chromium-based browsers using Google policies)
+    $chromiumPaths = @(
+        "HKLM:\Software\Policies\Google\Chrome",
+        "HKLM:\Software\Policies\BraveSoftware\Brave",
+        "HKLM:\Software\Policies\Vivaldi",
+        "HKLM:\Software\Policies\Opera"
+    )
+    foreach ($path in $chromiumPaths) {
+        if (!(Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+        Set-ItemProperty -Path $path -Name "DnsOverHttpsMode" -Value "off" -Type String
+    }
+
+    # Microsoft Edge (Chromium)
+    $edgePoliciesPath = "HKLM:\Software\Policies\Microsoft\Edge"
+    if (!(Test-Path $edgePoliciesPath)) { New-Item -Path $edgePoliciesPath -Force | Out-Null }
+    Set-ItemProperty -Path $edgePoliciesPath -Name "DnsOverHttpsMode" -Value "off" -Type String
+
+    # Mozilla Firefox (per-profile config)
+    $firefoxProfilesPath = "$env:APPDATA\Mozilla\Firefox\Profiles"
+    if (Test-Path $firefoxProfilesPath) {
+        Get-ChildItem -Directory $firefoxProfilesPath | ForEach-Object {
+            $prefsFile = Join-Path $_.FullName "prefs.js"
+            if (Test-Path $prefsFile) {
+                if (-not (Select-String -Path $prefsFile -Pattern "network.trr.mode")) {
+                    Add-Content -Path $prefsFile -Value 'user_pref("network.trr.mode", 5);'
+                }
+            }
+        }
+    }
+
+    # Logging
+    Write-Host "DoH has been disabled for supported browsers."
+}
+
+# Call the function
+Disable-DoH
