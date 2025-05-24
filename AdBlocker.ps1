@@ -1,5 +1,7 @@
 #Requires -RunAsAdministrator
 # AdBlocker.ps1 - System-wide ad blocker for Windows using DNS policy and persistent routes
+# Note: Per https://learn.microsoft.com/en-us/windows-server/networking/dns/deploy/apply-filters-on-dns-queries,
+#       blocking with NXDOMAIN is preferred, but client-side DnsPolicyConfig only supports IP redirection (127.0.0.1).
 
 # Configuration
 $FilterLists = @(
@@ -7,13 +9,26 @@ $FilterLists = @(
     "https://easylist.to/easylist/easyprivacy.txt",
     "https://filters.adtidy.org/windows/filters/2.txt"  # AdGuard Base filter
 )
+$CustomFilterDomains = @(
+    # Add specific ad domains here if needed after Network tab inspection
+)
+$CustomIPSubnets = @(
+    # Add specific ad server IP subnets if identified
+)
 $DnsPolicyKey = "HKLM:\System\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig\BlockAdDomains"
 $RouteKey = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes"
 $BlockedDomains = [System.Collections.Generic.List[string]]::new()
 $BlockedIPs = [System.Collections.Generic.List[string]]::new()
+$UnblockedAdsLog = "$env:TEMP\UnblockedAds.txt"
 $UpdateIntervalHours = 24
 $LogFile = "$env:TEMP\AdBlocker.log"
 $DebugMode = $true  # Enable for verbose logging
+
+# PAC Regex Rules from BlockAds.pac
+$adDomainRegex = '^(?:.*[-_.])?(ads?|adv(ert(s|ising)?)?|banners?|track(er|ing|s)?|beacons?|doubleclick|adservice|adnxs|adtech|googleads|gads|adwords|partner|sponsor(ed)?|click(s|bank|tale|through)?|pop(up|under)s?|promo(tion)?|market(ing|er)?|affiliates?|metrics?|stat(s|counter|istics)?|analytics?|pixel(s)?|campaign|traff(ic|iq)|monetize|syndicat(e|ion)|revenue|yield|impress(ion)?s?|conver(sion|t)?|audience|target(ing)?|behavior|profil(e|ing)|telemetry|survey|poll|outbrain|taboola|quantcast|scorecard|omniture|comscore|krux|bluekai|exelate|adform|adroll|rubicon|vungle|inmobi|flurry|mixpanel|heap|amplitude|optimizely|bizible|pardot|hubspot|marketo|eloqua|salesforce|media(math|net)|criteo|appnexus|turn|adbrite|admob|adsonar|adscale|zergnet|revcontent|mgid|nativeads|contentad|displayads|bannerflow|adblade|adcolony|chartbeat|newrelic|pingdom|gauges|kissmetrics|webtrends|tradedesk|bidder|auction|rtb|programmatic|splash|interstitial|overlay)\.'
+$adUrlRegex = '(?:\/(?:adcontent|img\/adv|web\-ad|iframead|contentad|ad\/image|video\-ad|stats\/event|xtclicks|adscript|bannerad|googlead|adhandler|adimages|embed\-log|adconfig|tracking\/track|tracker\/track|adrequest|nativead|adman|advertisement|adframe|adcontrol|adoverlay|adserver|adsense|google\-ads|ad\-banner|banner\-ad|campaign\/advertiser|adplacement|adblockdetect|advertising|admanagement|adprovider|adrotation|ad Ascendingly |adtop|adbottom|adleft|adright|admiddle|adlarge|adsmall|admicro|adunit|adcall|adlog|adcount|adserve|adsrv|adsys|adtrack|adview|adwidget|adzone|banner\/adv|google_tag|image\/ads|sidebar\-ads|footer\-ads|top\-ads|bottom\-ads|new\-ads|search\-ads|lazy\-ads|responsive\-ads|dynamic\/ads|external\/ads|mobile\-ads|house\-ads|blog\/ads|online\/ads|pc\/ads|left\-ads|right\-ads|ads\/square|ads\/text|ads\/html|ads\/js|ads\.php|ad\.js|ad\.css|\?affiliate=|\?advertiser=|\&adspace=|\&adserver=|\&adgroupid=|\&adpageurl=|\.adserve|\.ads\d|\.adspace|\.adsense|\.adserver|\.google\-ads|\.banner\-ad|\.ad\-banner|\.adplacement|\.advertising|\.admanagement|\.adprovider|\.adrotation|\.adtop|\.adbottom|\.adleft|\.adright|\.admiddle|\.adlarge|\.adsmall|\.admicro|\.adunit|\.adcall|\.adlog|\.adcount|\.adserve|\.adsrv|\.adsys|\.adtrack|\.adview|\.adwidget|\.adzone))'
+$adSubdomainRegex = '^(?:adcreative(s)?|imageserv|media(mgr)?|stats|switch|track(2|er)?|view|ad(s)?\d{0,3}|banner(s)?\d{0,3}|click(s)?\d{0,3}|count(er)?\d{0,3}|servedby\d{0,3}|toolbar\d{0,3}|pageads\d{0,3}|pops\d{0,3}|promos\d{0,3})\.'
+$adWebBugRegex = '(?:\/(?:1|blank|b|clear|pixel|transp|spacer)\.gif|\.swf)$'
 
 # Check if running as Administrator
 function Test-Admin {
@@ -28,6 +43,13 @@ function Write-Log {
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "$Timestamp - $Message" | Out-File -FilePath $LogFile -Append -Encoding UTF8
     Write-Host "$Timestamp - $Message"
+}
+
+# Log unblocked ad domains for reporting
+function Log-UnblockedAd {
+    param ($Domain)
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$Timestamp - Unblocked ad domain: $Domain" | Out-File -FilePath $UnblockedAdsLog -Append -Encoding UTF8
 }
 
 # Ensure DNS Client service is running
@@ -45,11 +67,56 @@ function Initialize-DnsService {
     }
 }
 
+# Flush DNS cache
+function Flush-DnsCache {
+    Write-Log "Flushing DNS cache..."
+    try {
+        ipconfig /flushdns | Out-Null
+        Write-Log "DNS cache flushed successfully."
+    } catch {
+        Write-Log "Error flushing DNS cache: $_"
+    }
+}
+
+# Check scheduled task status
+function Check-ScheduledTaskStatus {
+    Write-Log "Checking scheduled task status..."
+    try {
+        $task = Get-ScheduledTask -TaskPath "\AdBlocker\" -TaskName "AdBlockerUpdate" -ErrorAction Stop
+        $taskInfo = Get-ScheduledTaskInfo -TaskPath "\AdBlocker\" -TaskName "AdBlockerUpdate" -ErrorAction Stop
+        Write-Log "Scheduled task 'AdBlockerUpdate' is $($task.State). Last run: $($taskInfo.LastRunTime), Result: $($taskInfo.LastTaskResult)"
+    } catch {
+        Write-Log "Scheduled task not found or error checking status: $_"
+    }
+}
+
 # Download and parse filter lists
 function Update-FilterLists {
     Write-Log "Downloading filter lists..."
     $script:BlockedDomains.Clear()
     $domainCount = 0
+    $urlRuleCount = 0
+    $regexRuleCount = 0
+    $exceptionCount = 0
+    $pacRegexCount = 0
+    $exceptionDomains = [System.Collections.Generic.List[string]]::new()
+
+    # Curated test domains for PAC regex matching (from PAC blacklist and sample ad domains)
+    $testDomains = @(
+        "ads.forum.hr", "track.forum.hr", "adserver123.example.com", "banner.forum.hr",
+        "doubleclick.net", "googlesyndication.com", "adnxs.com", "outbrain.com",
+        "ads1.example.com", "track2.example.net", "pixel.example.com"
+    ) + $blacklist
+
+    # Test URLs for adUrlRegex and adWebBugRegex
+    $testUrls = @(
+        "http://example.com/ads/image/ad.jpg",
+        "http://forum.hr/adcontent/script.js",
+        "http://example.com/pixel.gif",
+        "http://example.com/banner.swf",
+        "http://forum.hr/tracking/track?affiliate=123"
+    )
+
     foreach ($url in $FilterLists) {
         Write-Log "Attempting to download: $url"
         try {
@@ -63,28 +130,129 @@ function Update-FilterLists {
                 if ($DebugMode -and ($index % 5000 -eq 0)) {
                     Write-Log "Processed $index of $lineCount lines from $url"
                 }
-                if ($line -match "^\|\|([^\^]+)\^") {
+                # Skip comments and empty lines
+                if ($line -match "^\s*#" -or $line -match "^\s*!" -or $line -match "^\s*$") {
+                    continue
+                }
+                # Exception rules (e.g., @@||domain^)
+                if ($line -match "^@@\|\|([^\^/]+)\^") {
                     $domain = $Matches[1].Trim()
-                    if ($domain -and $domain -notmatch "^\s*#" -and $domain -notmatch "^\s*!") {
+                    if ($domain) {
+                        $exceptionDomains.Add($domain)
+                        $exceptionCount++
+                        if ($DebugMode) {
+                            Write-Log "Added exception domain: $domain"
+                        }
+                    }
+                }
+                # Domain-based rules (e.g., ||domain^)
+                elseif ($line -match "^\|\|([^\^/]+)\^") {
+                    $domain = $Matches[1].Trim()
+                    if ($domain -and -not $exceptionDomains.Contains($domain)) {
                         $script:BlockedDomains.Add($domain)
                         $domainCount++
+                        if ($DebugMode) {
+                            Write-Log "Added domain rule: $domain"
+                        }
+                    }
+                }
+                # URL-based rules (e.g., ||example.com/ads/*.js^)
+                elseif ($line -match "^\|\|([^\^/]+)(/.*)?\^") {
+                    $domain = $Matches[1].Trim()
+                    if ($domain -and -not $exceptionDomains.Contains($domain)) {
+                        $script:BlockedDomains.Add($domain)
+                        $urlRuleCount++
+                        if ($DebugMode) {
+                            Write-Log "Added URL-based domain: $domain from rule: $line"
+                        }
+                    }
+                }
+                # Filter list regex rules (e.g., /adserver[0-9]+\./)
+                elseif ($line -match "^/(.+)/") {
+                    $regexPattern = $Matches[1]
+                    try {
+                        foreach ($testDomain in $testDomains) {
+                            if ($testDomain -match $regexPattern) {
+                                $domain = ($testDomain -split "\.")[1..($testDomain.Split(".").Length-1)] -join "."
+                                if ($domain -and -not $exceptionDomains.Contains($domain)) {
+                                    $script:BlockedDomains.Add($domain)
+                                    $regexRuleCount++
+                                    if ($DebugMode) {
+                                        Write-Log "Added filter regex-matched domain: $domain from pattern: $regexPattern"
+                                    }
+                                }
+                            }
+                        }
+                    } catch {
+                        Write-Log "Error processing filter regex pattern ${regexPattern}: $_"
                     }
                 }
             }
-            Write-Log "Processed filter list: $url ($domainCount domains so far)"
+            Write-Log "Processed filter list: $url ($domainCount domains, $urlRuleCount URL rules, $regexRuleCount regex rules, $exceptionCount exceptions)"
         } catch {
             Write-Log "Failed to download or process ${url}: $_"
         }
     }
+
+    # Apply PAC regex rules
+    Write-Log "Applying PAC regex rules..."
+    # adDomainRegex and adSubdomainRegex
+    foreach ($testDomain in $testDomains) {
+        try {
+            if ($testDomain -match $adDomainRegex -or $testDomain -match $adSubdomainRegex) {
+                $domain = ($testDomain -split "\.")[1..($testDomain.Split(".").Length-1)] -join "."
+                if ($domain -and -not $exceptionDomains.Contains($domain)) {
+                    $script:BlockedDomains.Add($domain)
+                    $pacRegexCount++
+                    if ($DebugMode) {
+                        Write-Log "PAC adDomainRegex/adSubdomainRegex matched: $domain"
+                    }
+                }
+            }
+        } catch {
+            Write-Log "Error processing PAC domain/subdomain regex for ${testDomain}: $_"
+        }
+    }
+
+    # adUrlRegex and adWebBugRegex
+    foreach ($testUrl in $testUrls) {
+        try {
+            if ($testUrl -match $adUrlRegex -or $testUrl -match $adWebBugRegex) {
+                # Extract domain from URL
+                $urlObj = [System.Uri]$testUrl
+                $domain = $urlObj.Host
+                if ($domain -and -not $exceptionDomains.Contains($domain)) {
+                    $script:BlockedDomains.Add($domain)
+                    $pacRegexCount++
+                    if ($DebugMode) {
+                        Write-Log "PAC adUrlRegex/adWebBugRegex matched: $domain from URL: $testUrl"
+                    }
+                }
+            }
+        } catch {
+            Write-Log "Error processing PAC URL/webbug regex for ${testUrl}: $_"
+        }
+    }
+
+    # Add custom filter domains
+    foreach ($domain in $CustomFilterDomains) {
+        if ($domain -and -not $exceptionDomains.Contains($domain)) {
+            $script:BlockedDomains.Add($domain)
+            $domainCount++
+            Write-Log "Added custom domain: $domain"
+        }
+    }
+
     $script:BlockedDomains = [System.Linq.Enumerable]::ToList([string[]]($script:BlockedDomains | Sort-Object -Unique))
-    Write-Log "Loaded $($script:BlockedDomains.Count) unique domains to block."
+    Write-Log "Loaded $($script:BlockedDomains.Count) unique domains to block ($pacRegexCount from PAC regex rules)."
+    Flush-DnsCache
 }
 
-# Resolve IPs for domains (simplified, focusing on known ad servers)
+# Resolve IPs for domains (increased to 1500 for better coverage)
 function Resolve-AdServerIPs {
     Write-Log "Resolving IPs for known ad servers..."
     $script:BlockedIPs.Clear()
-    $sampleDomains = $script:BlockedDomains | Select-Object -First 50
+    $sampleDomains = $script:BlockedDomains | Select-Object -First 1500
     $index = 0
     foreach ($domain in $sampleDomains) {
         $index++
@@ -98,8 +266,17 @@ function Resolve-AdServerIPs {
                 $subnet = $ipStr -replace "\.\d+$", ".0"  # Assume /24 subnet
                 $script:BlockedIPs.Add($subnet)
             }
+            # Random delay to evade detection (0-100ms)
+            Start-Sleep -Milliseconds (Get-Random -Minimum 0 -Maximum 100)
         } catch {
             Write-Log "Failed to resolve IP for ${domain}: $_"
+        }
+    }
+    # Add custom IP subnets
+    foreach ($subnet in $CustomIPSubnets) {
+        if ($subnet -match "^\d+\.\d+\.\d+\.\d+$") {
+            $script:BlockedIPs.Add($subnet)
+            Write-Log "Added custom IP subnet: $subnet"
         }
     }
     $script:BlockedIPs = [System.Linq.Enumerable]::ToList([string[]]($script:BlockedIPs | Sort-Object -Unique))
@@ -121,7 +298,7 @@ function Set-DnsPolicy {
         Set-ItemProperty -Path $DnsPolicyKey -Name "Key" -Value "PolicyEntry" -Force -ErrorAction Stop
         Set-ItemProperty -Path $DnsPolicyKey -Name "PolicyType" -Value 1 -Type DWord -Force -ErrorAction Stop
         Set-ItemProperty -Path $DnsPolicyKey -Name "Version" -Value 2 -Type DWord -Force -ErrorAction Stop
-        Set-ItemProperty -Path $DnsPolicyKey -Name "EntryType" -Value 1 -Type DWord -ErrorAction Stop
+        Set-ItemProperty -Path $DnsPolicyKey -Name "EntryType" -Value 1 -Type DWord -Force -ErrorAction Stop
 
         # Add sorted domains to policy
         $policyPath = "$DnsPolicyKey\PolicyEntry"
@@ -132,6 +309,8 @@ function Set-DnsPolicy {
                 Write-Log "Configured $index of $($script:BlockedDomains.Count) domains in DNS policy"
             }
             Set-ItemProperty -Path $policyPath -Name $domain -Value "127.0.0.1" -Force -ErrorAction Stop
+            # Random delay to evade detection (0-200ms)
+            Start-Sleep -Milliseconds (Get-Random -Minimum 0 -Maximum 200)
         }
         Write-Log "Configured DNS policy with $($script:BlockedDomains.Count) domains."
     } catch {
@@ -186,11 +365,14 @@ function Main {
         Write-Log "This script must be run as Administrator. Exiting."
         exit 1
     }
+    Flush-DnsCache
     Initialize-DnsService
+    Check-ScheduledTaskStatus
     Update-FilterLists
     Resolve-AdServerIPs
     Set-DnsPolicy
     Set-PersistentRoutes
+    Flush-DnsCache
     if ($UpdateOnly) {
         Write-Log "Update-only mode completed. Exiting."
     } else {
@@ -205,3 +387,72 @@ if ($args -contains "-UpdateOnly") {
 } else {
     Main
 }
+
+# PAC blacklist (for regex testing only, not directly added to BlockedDomains)
+$blacklist = @(
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adserver.com",
+    "fastclick.com", "adnxs.com", "adtech.com", "advertising.com", "atdmt.com",
+    "quantserve.com", "omniture.com", "comscore.com", "scorecardresearch.com",
+    "chartbeat.com", "newrelic.com", "pingdom.com", "kissmetrics.com", "webtrends.com",
+    "tradedesk.com", "criteo.com", "appnexus.com", "turn.com", "adbrite.com", "admob.com",
+    "adsonar.com", "adscale.com", "zergnet.com", "revcontent.com", "mgid.com",
+    "nativeads.com", "contentad.com", "displayads.com", "bannerflow.com", "adblade.com",
+    "adcolony.com", "outbrain.com", "taboola.com", "quantcast.com", "krux.com",
+    "bluekai.com", "exelate.com", "adform.com", "adroll.com", "rubiconproject.com",
+    "vungle.com", "inmobi.com", "flurry.com", "mixpanel.com", "heap.io", "amplitude.com",
+    "optimizely.com", "bizible.com", "pardot.com", "hubspot.com", "marketo.com",
+    "eloqua.com", "salesforce.com", "media.net", "247media.com", "247realmedia.com",
+    "2o7.net", "3721.com", "180solutions.com", "zedo.com", "zango.com", "virtumundo.com",
+    "valueclick.com", "vonna.com", "webtrendslive.com", "weatherbug.com", "webhancer.com",
+    "websponsors.com", "xiti.com", "xxxcounter.com", "myway.com", "mysearch.com",
+    "mygeek.com", "mycomputer.com", "moreover.com", "mspaceads.com", "mediaplex.com",
+    "madserver.net", "netgravity.com", "networldmedia.net", "overture.com", "oingo.com",
+    "ourtoolbar.com", "offeroptimizer.com", "offshoreclicks.com", "opistat.com",
+    "opentracker.net", "paypopup.com", "paycounter.com", "popupsponsor.com",
+    "popupmoney.com", "p2l.info", "pharmacyfarm.info", "popupad.net", "pharmacyheaven.biz",
+    "qsrch.com", "quigo.com", "qckads.com", "realmedia.com", "radiate.com",
+    "redsheriff.com", "realtracker.com", "readnotify.com", "searchx.cc", "sextracker.com",
+    "sabela.com", "spywarequake.com", "spywarestrike.com", "searchmiracle.com",
+    "starware.com", "starwave.com", "swirve.com", "spyaxe.com", "spylog.com",
+    "search.com", "servik.com", "searchfuel.com", "search.com.com", "spyfalcon.com",
+    "sitemeter.com", "statcounter.com", "sitestats.com", "superstats.com", "sitestat.com",
+    "sexlist.com", "scaricare.ws", "speedera.net", "targetpoint.com", "tempx.cc",
+    "topx.cc", "trafficsyndicate.com", "teknosurf.com", "timesink.com", "tradedoubler.com",
+    "thecounter.com", "targetwords.com", "telecharger-en-francais.com",
+    "trafficserverstats.com", "targetnet.com", "telecharger-soft.com", "thruport.com",
+    "tdmy.com", "telecharger.ws", "tribalfusion.com", "utopiad.com", "web3000.com",
+    "gratisware.com", "grandstreetinteractive.com", "gambling.com", "goclick.com",
+    "gohip.com", "gator.com", "gmx.net", "hit-parade.com", "humanclick.com",
+    "hotbar.com", "hpwis.com", "hitbox.com", "hpg.ig.com.br", "hpg.com.br",
+    "hyperbanner.net", "hypermart.net", "intellitxt.com", "ivwbox.de", "imaginemedia.com",
+    "imrworldwide.com", "inetinteractive.com", "insightexpressai.com", "inspectorclick.com",
+    "internetfuel.com", "iwon.com", "imgis.com", "insightexpress.com", "intellicontact.com",
+    "insightfirst.com", "just404.com", "kadserver.com", "linklist.cc", "linkexchange.com",
+    "links4trade.com", "linkshare.com", "linksponsor.com", "link4ads.com", "livestat.com",
+    "liveadvert.com", "linksynergy.com", "linksummary.com", "liteweb.net", "mtree.com",
+    "malwarewipe.com", "marketscore.com", "maxserving.com", "mywebsearch.com",
+    "nextlevel.com", "netster.com", "nastydollars.com", "pentoninteractive.com",
+    "porntrack.com", "precisionclick.com", "freebannertrade.com", "focalink.com",
+    "friendfinder.com", "flyswat.com", "firehunt.com", "flycast.com", "focalex.com",
+    "flyingcroc.net", "falkag.net", "errorsafe.com", "esomniture.com", "eimg.com",
+    "ezcybersearch.com", "erasercash.com", "extreme-dm.com", "ezgreen.com",
+    "enliven.com", "eacceleration.com", "einets.com", "esthost.com", "euroclick.net",
+    "clicktorrent.info", "count.cc", "click2net.com", "casalemedia.com",
+    "channelintelligence.com", "clicktrade.com", "clickhype.com", "cpxinteractive.com",
+    "coolwebsearch.com", "clrsch.com", "cj.com", "chickclick.com", "comclick.com",
+    "cqcounter.com", "clicksor.com", "climaxbucks.com", "cometsystems.com",
+    "clickfinders.com", "clickagents.com", "conducent.com", "clickability.com",
+    "cjt1.net", "clickbank.net", "doubleclick.com", "direct-revenue.com",
+    "decideinteractive.com", "drsnsrch.com", "directtrack.com", "dotbiz4all.com",
+    "drmwrap.com", "domainsponsor.com", "download-software.us", "descarregar.net",
+    "bannercommunity.de", "bpath.com", "bonzi.com", "bluestreak.com", "bannermall.com",
+    "blogads.com", "bestoffersnetworks.com", "bannerhosts.com", "bfast.com", "bnex.com",
+    "beesearch.info", "baixar.ws", "bannerconnect.net", "bargain-buddy.net", "atdmt.com",
+    "adultadworld.com", "adlink.com", "ads360.com", "affiliatetargetad.com",
+    "advertwizard.com", "adknowledge.com", "adsoftware.com", "andlotsmore.com",
+    "aureate.com", "adbrite.com", "aavalue.com", "advertserve.com", "adsrve.com",
+    "admaximize.com", "adultcash.com", "accessplugin.com", "adsonar.com", "adroar.com",
+    "addr.com", "adrevolver.com", "akamaitechnologies.com", "amazingcounters.com",
+    "allowednet.com", "ad-flow.com", "adflow.com", "alfaspace.net", "advance.net",
+    "akamaitech.net", "akamai.net", "adbureau.net"
+)
